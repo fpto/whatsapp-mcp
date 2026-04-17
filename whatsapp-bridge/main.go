@@ -94,6 +94,16 @@ func NewMessageStore() (*MessageStore, error) {
 			updated_at TIMESTAMP
 		);
 		CREATE INDEX IF NOT EXISTS idx_senders_names ON senders(full_name, push_name);
+
+		CREATE TABLE IF NOT EXISTS lid_mappings (
+			lid_jid TEXT PRIMARY KEY,
+			phone_jid TEXT NOT NULL,
+			phone_number TEXT NOT NULL,
+			discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_lid_phone ON lid_mappings(phone_number);
+		CREATE INDEX IF NOT EXISTS idx_lid_phone_jid ON lid_mappings(phone_jid);
 	`)
 	if err != nil {
 		db.Close()
@@ -244,6 +254,62 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	}
 
 	return chats, nil
+}
+
+// StoreLIDMapping stores a mapping between a LID JID and a phone-based JID
+func (store *MessageStore) StoreLIDMapping(lidJID, phoneJID, phoneNumber string) error {
+	_, err := store.db.Exec(
+		`INSERT OR REPLACE INTO lid_mappings (lid_jid, phone_jid, phone_number, updated_at)
+		 VALUES (?, ?, ?, CURRENT_TIMESTAMP)`,
+		lidJID, phoneJID, phoneNumber,
+	)
+	return err
+}
+
+// GetPhoneByLID looks up a phone number given a LID JID
+func (store *MessageStore) GetPhoneByLID(lidJID string) (string, error) {
+	var phoneNumber string
+	err := store.db.QueryRow("SELECT phone_number FROM lid_mappings WHERE lid_jid = ?", lidJID).Scan(&phoneNumber)
+	if err != nil {
+		return "", err
+	}
+	return phoneNumber, nil
+}
+
+// GetLIDByPhone looks up a LID JID given a phone number
+func (store *MessageStore) GetLIDByPhone(phoneNumber string) (string, error) {
+	var lidJID string
+	err := store.db.QueryRow("SELECT lid_jid FROM lid_mappings WHERE phone_number = ?", phoneNumber).Scan(&lidJID)
+	if err != nil {
+		return "", err
+	}
+	return lidJID, nil
+}
+
+// GetAllLIDMappings returns all LID to phone mappings
+func (store *MessageStore) GetAllLIDMappings() ([]map[string]string, error) {
+	rows, err := store.db.Query("SELECT lid_jid, phone_jid, phone_number, discovered_at, updated_at FROM lid_mappings ORDER BY updated_at DESC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var mappings []map[string]string
+	for rows.Next() {
+		var lidJID, phoneJID, phoneNumber, discoveredAt, updatedAt string
+		err := rows.Scan(&lidJID, &phoneJID, &phoneNumber, &discoveredAt, &updatedAt)
+		if err != nil {
+			return nil, err
+		}
+		mappings = append(mappings, map[string]string{
+			"lid_jid":       lidJID,
+			"phone_jid":     phoneJID,
+			"phone_number":  phoneNumber,
+			"discovered_at": discoveredAt,
+			"updated_at":    updatedAt,
+		})
+	}
+	return mappings, nil
 }
 
 // Extract text content from a message
@@ -503,6 +569,39 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	}
 	if err := messageStore.StoreSender(senderJID, msg.Info.PushName, fullName, firstName, businessName); err != nil {
 		logger.Warnf("Failed to store sender: %v", err)
+	}
+
+	// Capture LID mapping if chat uses LID format
+	if msg.Info.Chat.Server == "lid" {
+		lidJID := chatJID
+		// If the sender has a phone-based JID, map LID to phone
+		if msg.Info.Sender.Server == "s.whatsapp.net" && !msg.Info.IsFromMe {
+			phoneNumber := msg.Info.Sender.User
+			phoneJID := phoneNumber + "@s.whatsapp.net"
+			if err := messageStore.StoreLIDMapping(lidJID, phoneJID, phoneNumber); err != nil {
+				logger.Warnf("Failed to store LID mapping from sender: %v", err)
+			} else {
+				logger.Infof("Stored LID mapping: %s -> %s", lidJID, phoneJID)
+			}
+		} else {
+			// Try to resolve via contacts store
+			contact, err := client.Store.Contacts.GetContact(context.Background(), msg.Info.Chat)
+			if err == nil && contact.FullName != "" {
+				// Try to find a phone-based JID from the contact
+				// The contact's JID user part might contain the phone number
+				if msg.Info.Chat.User != "" {
+					// Check if there's a participant with a phone JID
+					// For 1:1 chats, try to get the phone from the sender info
+					if msg.Info.Sender.Server == "s.whatsapp.net" {
+						phoneNumber := msg.Info.Sender.User
+						phoneJID := phoneNumber + "@s.whatsapp.net"
+						if err := messageStore.StoreLIDMapping(lidJID, phoneJID, phoneNumber); err != nil {
+							logger.Warnf("Failed to store LID mapping from contact: %v", err)
+						}
+					}
+				}
+			}
+		}
 	}
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
@@ -871,6 +970,62 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for LID mappings - reads from whatsmeow's built-in lid_map table
+	http.HandleFunc("/api/lid-mappings", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		// Open whatsmeow's device store DB which contains the lid_map
+		wmDB, err := sql.Open("sqlite3", "file:store/whatsapp.db?mode=ro")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		defer wmDB.Close()
+
+		phone := r.URL.Query().Get("phone")
+		lid := r.URL.Query().Get("lid")
+
+		var rows *sql.Rows
+
+		if phone != "" {
+			rows, err = wmDB.Query("SELECT lid, pn FROM whatsmeow_lid_map WHERE pn LIKE ?", "%"+phone+"%")
+		} else if lid != "" {
+			rows, err = wmDB.Query("SELECT lid, pn FROM whatsmeow_lid_map WHERE lid LIKE ?", "%"+lid+"%")
+		} else {
+			rows, err = wmDB.Query("SELECT lid, pn FROM whatsmeow_lid_map")
+		}
+
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		defer rows.Close()
+
+		var mappings []map[string]string
+		for rows.Next() {
+			var lidUser, pn string
+			if err := rows.Scan(&lidUser, &pn); err != nil {
+				continue
+			}
+			mappings = append(mappings, map[string]string{
+				"lid_jid":      lidUser + "@lid",
+				"phone_jid":    pn + "@s.whatsapp.net",
+				"phone_number": pn,
+			})
+		}
+		if mappings == nil {
+			mappings = []map[string]string{}
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"mappings": mappings})
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -941,6 +1096,10 @@ func main() {
 		case *events.HistorySync:
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
+
+		case *events.AppState:
+			// Capture LID-to-phone mappings from app state sync
+			handleAppStateLIDMapping(messageStore, v, logger)
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
@@ -1115,6 +1274,52 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	return name
 }
 
+// handleAppStateLIDMapping captures LID-to-phone mappings from WhatsApp's app state sync.
+// When WhatsApp syncs PnForLidChatAction events, they contain the phone JID for a LID chat.
+// Index[1] contains the LID JID, and PnForLidChatAction.PnJID contains the phone-based JID.
+func handleAppStateLIDMapping(messageStore *MessageStore, evt *events.AppState, logger waLog.Logger) {
+	pnAction := evt.GetPnForLidChatAction()
+	if pnAction == nil {
+		return
+	}
+
+	pnJID := pnAction.GetPnJID()
+	if pnJID == "" {
+		return
+	}
+
+	// Index[1] should contain the LID JID
+	if len(evt.Index) < 2 {
+		logger.Warnf("PnForLidChatAction received but Index has fewer than 2 elements: %v", evt.Index)
+		return
+	}
+
+	lidJID := evt.Index[1]
+	if lidJID == "" {
+		return
+	}
+
+	// Ensure the LID JID has the @lid suffix
+	if !strings.Contains(lidJID, "@") {
+		lidJID = lidJID + "@lid"
+	}
+
+	// Extract phone number from the phone JID (e.g., "50498183144@s.whatsapp.net" -> "50498183144")
+	phoneNumber := strings.Split(pnJID, "@")[0]
+
+	// Ensure the phone JID has the @s.whatsapp.net suffix
+	if !strings.Contains(pnJID, "@") {
+		pnJID = pnJID + "@s.whatsapp.net"
+	}
+
+	err := messageStore.StoreLIDMapping(lidJID, pnJID, phoneNumber)
+	if err != nil {
+		logger.Warnf("Failed to store LID mapping from AppState: %v", err)
+	} else {
+		logger.Infof("Stored LID mapping from AppState sync: %s -> %s (phone: %s)", lidJID, pnJID, phoneNumber)
+	}
+}
+
 // Handle history sync events
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
 	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
@@ -1133,6 +1338,16 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		if err != nil {
 			logger.Warnf("Failed to parse JID %s: %v", chatJID, err)
 			continue
+		}
+
+		// Capture LID mapping if this is a LID-based chat
+		if jid.Server == "lid" {
+			// Try to resolve the contact to get a phone number
+			contact, contactErr := client.Store.Contacts.GetContact(context.Background(), jid)
+			if contactErr == nil && contact.FullName != "" {
+				logger.Infof("LID chat %s has contact name: %s", chatJID, contact.FullName)
+			}
+			// We'll also try to discover phone mappings from message participants below
 		}
 
 		// Get appropriate chat name by passing the history sync conversation directly
@@ -1199,6 +1414,19 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					}
 					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
 						sender = *msg.Message.Key.Participant
+						// If the chat is LID-based and participant has a phone JID, capture mapping
+						if jid.Server == "lid" {
+							participantJID, parseErr := types.ParseJID(*msg.Message.Key.Participant)
+							if parseErr == nil && participantJID.Server == "s.whatsapp.net" {
+								phoneNumber := participantJID.User
+								phoneJID := phoneNumber + "@s.whatsapp.net"
+								if err := messageStore.StoreLIDMapping(chatJID, phoneJID, phoneNumber); err != nil {
+									logger.Warnf("Failed to store LID mapping from history participant: %v", err)
+								} else {
+									logger.Infof("Stored LID mapping from history: %s -> %s", chatJID, phoneJID)
+								}
+							}
+						}
 					} else if isFromMe {
 						sender = client.Store.ID.User
 					} else {

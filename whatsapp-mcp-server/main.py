@@ -12,7 +12,8 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    get_lid_mappings as whatsapp_get_lid_mappings
 )
 
 # Initialize FastMCP server
@@ -245,6 +246,20 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def get_lid_mappings(phone_number: Optional[str] = None, lid: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Get LID (Linked ID) to phone number mappings.
+
+    WhatsApp uses LID format (@lid) instead of phone-based JIDs (@s.whatsapp.net)
+    for some contacts. This tool helps resolve between the two formats.
+
+    Args:
+        phone_number: Optional phone number to find its LID mapping
+        lid: Optional LID to find its phone number mapping
+    """
+    mappings = whatsapp_get_lid_mappings(phone_number=phone_number, lid=lid)
+    return mappings
 
 if __name__ == "__main__":
     # Initialize and run the server
