@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -84,6 +85,17 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+
+		-- Persistent phone<->LID mapping.
+		-- WhatsApp increasingly addresses users by an opaque "LID" (@lid) instead of
+		-- their phone number (@s.whatsapp.net). We persist learned pairs so that senders
+		-- can always be resolved back to a stable phone number.
+		CREATE TABLE IF NOT EXISTS lid_mapping (
+			lid TEXT PRIMARY KEY,
+			phone TEXT NOT NULL,
+			updated_at TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_lid_mapping_phone ON lid_mapping(phone);
 	`)
 	if err != nil {
 		db.Close()
@@ -170,6 +182,50 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	}
 
 	return chats, nil
+}
+
+// StoreLIDMapping persists a learned phone<->LID pair and heals any messages that
+// were previously stored under the LID. Both values are the numeric "user" part of
+// the JID (without the @server suffix). Calls with missing or identical values, or
+// that don't actually change the stored mapping, are cheap no-ops.
+func (store *MessageStore) StoreLIDMapping(lid, phone string) error {
+	if lid == "" || phone == "" || lid == phone {
+		return nil
+	}
+
+	// Only overwrite an existing mapping if the phone number actually changed,
+	// so repeated calls with the same data don't churn the table or run backfills.
+	res, err := store.db.Exec(
+		`INSERT INTO lid_mapping (lid, phone, updated_at) VALUES (?, ?, ?)
+		 ON CONFLICT(lid) DO UPDATE SET phone = excluded.phone, updated_at = excluded.updated_at
+		 WHERE lid_mapping.phone != excluded.phone`,
+		lid, phone, time.Now(),
+	)
+	if err != nil {
+		return err
+	}
+
+	// If nothing was inserted/updated the mapping was already known; skip the backfill.
+	if affected, _ := res.RowsAffected(); affected == 0 {
+		return nil
+	}
+
+	// Backfill: rewrite any messages that were stored before we knew the phone number.
+	_, err = store.db.Exec("UPDATE messages SET sender = ? WHERE sender = ?", phone, lid)
+	return err
+}
+
+// GetPhoneForLID returns the phone number previously learned for a LID, if any.
+func (store *MessageStore) GetPhoneForLID(lid string) (string, bool) {
+	if lid == "" {
+		return "", false
+	}
+	var phone string
+	err := store.db.QueryRow("SELECT phone FROM lid_mapping WHERE lid = ?", lid).Scan(&phone)
+	if err != nil || phone == "" {
+		return "", false
+	}
+	return phone, true
 }
 
 // Extract text content from a message
@@ -408,11 +464,82 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	return "", "", "", nil, nil, nil, 0
 }
 
+// groupMappingSync rate-limits how often we hit the server to refresh a group's
+// participant list when resolving an unknown LID, so a burst of messages from a
+// not-yet-mapped member triggers at most one lookup per cooldown window.
+var (
+	groupMappingMu       sync.Mutex
+	groupMappingLastSync = make(map[string]time.Time)
+)
+
+const groupMappingCooldown = 5 * time.Minute
+
+// ensureGroupMappings fetches a group's participant list and records every
+// phone<->LID pair it exposes. GetGroupInfo is a network round-trip, so callers
+// only reach here when there's an unresolved LID and the per-group cooldown has
+// elapsed. Returns true if a refresh was actually performed.
+func ensureGroupMappings(client *whatsmeow.Client, store *MessageStore, groupJID types.JID, logger waLog.Logger) bool {
+	key := groupJID.String()
+
+	groupMappingMu.Lock()
+	if last, ok := groupMappingLastSync[key]; ok && time.Since(last) < groupMappingCooldown {
+		groupMappingMu.Unlock()
+		return false
+	}
+	groupMappingLastSync[key] = time.Now()
+	groupMappingMu.Unlock()
+
+	info, err := client.GetGroupInfo(groupJID)
+	if err != nil {
+		logger.Warnf("Failed to get group info for LID mapping (%s): %v", key, err)
+		return false
+	}
+
+	for _, p := range info.Participants {
+		if p.JID.Server == types.DefaultUserServer && p.LID.Server == types.HiddenUserServer {
+			if err := store.StoreLIDMapping(p.LID.User, p.JID.User); err != nil {
+				logger.Warnf("Failed to store LID mapping %s->%s: %v", p.LID.User, p.JID.User, err)
+			}
+		}
+	}
+	return true
+}
+
+// resolveSender returns a stable identifier (the numeric user part) for a message
+// sender, mapping opaque @lid addresses back to phone numbers whenever possible.
+// Phone-number senders are returned as-is; LID senders are resolved through the
+// persistent mapping, falling back to an on-demand group participant lookup, and
+// only as a last resort returning the raw LID.
+func resolveSender(client *whatsmeow.Client, store *MessageStore, sender, chat types.JID, logger waLog.Logger) string {
+	if sender.Server != types.HiddenUserServer {
+		// Already a phone number (or some other addressable identity); use it directly.
+		return sender.User
+	}
+
+	// Sender is a LID. Try the persistent mapping first.
+	if phone, ok := store.GetPhoneForLID(sender.User); ok {
+		return phone
+	}
+
+	// Unknown LID: refresh the group's participant list (rate-limited) and retry.
+	if chat.Server == types.GroupServer {
+		if ensureGroupMappings(client, store, chat, logger) {
+			if phone, ok := store.GetPhoneForLID(sender.User); ok {
+				return phone
+			}
+		}
+	}
+
+	// Couldn't resolve; keep the LID so the message is still attributed consistently.
+	logger.Debugf("Could not resolve LID %s to a phone number", sender.User)
+	return sender.User
+}
+
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
 	// Save message to database
 	chatJID := msg.Info.Chat.String()
-	sender := msg.Info.Sender.User
+	sender := resolveSender(client, messageStore, msg.Info.Sender, msg.Info.Chat, logger)
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
@@ -1088,7 +1215,13 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 						isFromMe = *msg.Message.Key.FromMe
 					}
 					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
-						sender = *msg.Message.Key.Participant
+						// Participant is a full JID; resolve any @lid back to a phone number
+						// so history-synced senders match live messages.
+						if participantJID, err := types.ParseJID(*msg.Message.Key.Participant); err == nil {
+							sender = resolveSender(client, messageStore, participantJID, jid, logger)
+						} else {
+							sender = *msg.Message.Key.Participant
+						}
 					} else if isFromMe {
 						sender = client.Store.ID.User
 					} else {

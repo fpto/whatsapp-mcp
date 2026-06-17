@@ -51,7 +51,7 @@ def get_sender_name(sender_jid: str) -> str:
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
+
         # First try matching by exact JID
         cursor.execute("""
             SELECT name
@@ -59,9 +59,9 @@ def get_sender_name(sender_jid: str) -> str:
             WHERE jid = ?
             LIMIT 1
         """, (sender_jid,))
-        
+
         result = cursor.fetchone()
-        
+
         # If no result, try looking for the number within JIDs
         if not result:
             # Extract the phone number part if it's a JID
@@ -69,7 +69,18 @@ def get_sender_name(sender_jid: str) -> str:
                 phone_part = sender_jid.split('@')[0]
             else:
                 phone_part = sender_jid
-                
+
+            # If this is an opaque LID, translate it to the phone number the
+            # bridge learned for it so name lookups still succeed. The table may
+            # not exist yet on databases created before this feature shipped.
+            try:
+                cursor.execute("SELECT phone FROM lid_mapping WHERE lid = ? LIMIT 1", (phone_part,))
+                mapping = cursor.fetchone()
+                if mapping and mapping[0]:
+                    phone_part = mapping[0]
+            except sqlite3.OperationalError:
+                pass
+
             cursor.execute("""
                 SELECT name
                 FROM chats
