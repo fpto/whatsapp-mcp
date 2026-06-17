@@ -159,6 +159,14 @@ You can send various media types to your WhatsApp contacts:
 
 By default, just the metadata of the media is stored in the local database. The message will indicate that media was sent. To access this media you need to use the download_media tool which takes the `message_id` and `chat_jid` (which are shown when printing messages containing the meda), this downloads the media and then returns the file path which can be then opened or passed to another tool.
 
+#### Phone ↔ LID Mapping
+
+WhatsApp increasingly addresses users by an opaque **LID** (`<number>@lid`) instead of their phone number (`<number>@s.whatsapp.net`), especially in groups. To keep senders attributable to a stable phone number, the Go bridge maintains a persistent `lid_mapping` table:
+
+- When a message arrives from an unknown LID, the bridge looks up the group's participant list (rate-limited per group) to learn the matching phone number, then caches the pair.
+- Learned mappings are reused for future messages and back-filled onto any messages that were already stored under the LID, so attribution self-heals over time.
+- The Python server also consults this table when resolving sender names.
+
 ## Technical Details
 
 1. Claude sends requests to the Python MCP server
